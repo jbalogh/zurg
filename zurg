@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+import collections
+from datetime import datetime
+import itertools
+
+import jinja2
+from path import path
+import yaml
+
+import helpers
+
+
+opts = {
+    'build_dir': '_build/',
+    'template_dir': '_templates/',
+    'posts_dir': '_posts/',
+}
+
+
+def read_yaml(file):
+    """
+    Read yaml front-matter, as in jekyll.
+
+    If '---' is the first or second line of a file, any text up to the next
+    '---' will be parsed as yaml.
+    """
+    lines = file.open().read().splitlines()
+    if '---' in lines[:2]:
+        first = lines.index('---')
+        second = lines.index('---', first + 1)
+        return yaml.load('\n'.join(lines[first:second]))
+    else:
+        return {}
+
+
+class Site(object):
+
+    def __init__(self, **kw):
+        for key, value in kw.items():
+            setattr(self, key, value)
+        self.time = datetime.now()
+
+
+class Page(object):
+
+    def __init__(self, file, context):
+        self.file = file
+        self.build_path = file
+        self.context = context
+
+    def render(self, env, **extra_context):
+        self.context.update(extra_context)
+        template = env.get_template(str(self.file))
+        context = template.new_context(self.context)
+        if 'article' in template.blocks:
+            self.content = ''.join(template.blocks['article'](context))
+        else:
+            self.content = ''
+        return template.render(context)
+
+    @property
+    def permalink(self):
+        if self.file.name == 'index.html':
+            return self.file.dirname()
+        else:
+            return self.file
+
+    @property
+    def tags(self):
+        return self.context.get('tags', '').split(',')
+
+    def __getattr__(self, name):
+        return self.context.get(name)
+
+
+class Post(Page):
+
+    @property
+    def build_path(self):
+        return path(self.context['permalink']) / 'index.html'
+
+
+class Zurg(object):
+
+    def __init__(self, **kw):
+        self.build_dir = path(kw['build_dir'])
+        self.template_dir = path(kw['template_dir'])
+        self.posts_dir = path(kw['posts_dir'])
+
+    def find_files(self):
+        # p[2:] removes './' from the beginning of paths.
+        all_files = (path(p[2:]) for p in path('.').walkfiles())
+        files = filter(self.ignore, all_files)
+        html = [f for f in files if f.ext == '.html']
+        return list(set(files) - set(html)), html
+
+    def find_posts(self):
+        if self.posts_dir.exists():
+            return path(self.posts_dir).walkfiles('*.html')
+        else:
+            return []
+
+    def ignore(self, pathname):
+        starts = (self.build_dir, self.template_dir, self.posts_dir, '_')
+        hidden = any(p.startswith('.') for p in pathname.split('/'))
+        return not hidden and not any(pathname.startswith(x) for x in starts)
+
+    def build_index(self, html, posts):
+        pages = [Page(file, read_yaml(file)) for file in html]
+        posts = [Post(file, read_yaml(file)) for file in posts]
+        for page in list(pages):
+            if page.date is not None:
+                pages.remove(page)
+                posts.append(page)
+        return (sorted(pages, key=lambda x: x.title),
+                sorted(posts, key=lambda x: (x.date, x.title)))
+
+    def build_tags(self, pages):
+        tags = collections.defaultdict(list)
+        for page in pages:
+            for tag in page.tags:
+                tags[tag].append(page)
+        del tags['']
+        return tags
+
+    def link_files(self, files):
+        build = self.build_dir
+        for file in files:
+            link = build / file
+            if not link.dirname().exists():
+                link.dirname().makedirs()
+            file.link(link)
+
+    def render(self, pages, posts, tags):
+        build = self.build_dir
+
+        loader = jinja2.FileSystemLoader(
+            ['.', self.posts_dir, self.template_dir])
+        env = jinja2.Environment(loader=loader)
+
+        for filter in helpers.filters:
+            env.filters[filter.__name__] = filter
+
+        def r2r(template, **kw):
+            try:
+                return env.get_template(template).render(kw)
+            except jinja2.TemplateNotFound:
+                return ''
+
+        env.globals['site'] = Site(posts=posts, pages=pages)
+
+        for page in itertools.chain(pages, posts):
+            depth = '../' * page.file.count('/')
+            content = page.render(env, depth=depth)
+            file = build / page.build_path
+            if not file.dirname().exists():
+                file.dirname().makedirs()
+            file.write_text(content)
+
+        for tag, items in tags.items():
+            tag_dir = build / 'tags' / tag
+            tag_dir.makedirs()
+            content = r2r('tag_list.html', tag=tag, items=items)
+            (tag_dir / 'index.html').write_text(content)
+            feed = tag_dir / 'feed.xml'
+            feed.write_text(r2r('tag_feed.xml', tag=tag, items=items))
+
+        (build / 'feed.xml').write_text(r2r('feed.xml', posts=posts))
+
+    def build(self):
+        files, html = self.find_files()
+        pages, posts = self.build_index(html, self.find_posts())
+        tags = self.build_tags(itertools.chain(pages, posts))
+
+        if self.build_dir.exists():
+            self.build_dir.rmtree()
+        self.build_dir.makedirs()
+
+        self.link_files(files)
+        self.render(pages, posts, tags)
+
+
+if __name__ == '__main__':
+    Zurg(**opts).build()
