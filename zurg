@@ -47,15 +47,16 @@ class Page(object):
         self.file = file
         self.build_path = file
         self.context = context
+        self.blocks = {}
 
     def render(self, env, **extra_context):
         self.context.update(extra_context)
         template = env.get_template(str(self.file))
         context = template.new_context(self.context)
-        if 'article' in template.blocks:
-            self.content = ''.join(template.blocks['article'](context))
-        else:
-            self.content = ''
+        # Save each piece for later so that something like a content block can
+        # be used for feed generation.
+        for block in template.blocks:
+            self.blocks[block] = ''.join(template.blocks[block](context))
         return template.render(context)
 
     @property
